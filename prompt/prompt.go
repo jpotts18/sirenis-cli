@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/elastic/go-elasticsearch"
 	openai "github.com/openai/openai-go"
@@ -14,6 +16,10 @@ import (
 )
 
 func Start(client *openai.Client) error {
+
+    // Configure logging
+    log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+    log.SetPrefix("[DEBUG] ")
 
     es, err := elasticsearch.NewDefaultClient()
     if err != nil {
@@ -45,6 +51,9 @@ func Start(client *openai.Client) error {
 }
 
 func processQuestion(client *openai.Client, es *elasticsearch.Client, question string) error {
+    startTime := time.Now()
+    log.Printf("Processing question: %q", question)
+
     // Generate embedding for the question
     resp, err := client.Embeddings.New(context.Background(), openai.EmbeddingNewParams{
         Input: openai.F[openai.EmbeddingNewParamsInputUnion](shared.UnionString(question)),
@@ -54,20 +63,24 @@ func processQuestion(client *openai.Client, es *elasticsearch.Client, question s
         return fmt.Errorf("error generating question embedding: %w", err)
     }
     questionEmbedding := resp.Data[0].Embedding
+    log.Printf("Question embedded successfully (vector size: %d)", len(questionEmbedding))
 
-    // Search for relevant chunks
-    results, err := searchChunks(es, questionEmbedding)
+
+    log.Println("Searching for relevant document chunks...")
+    results, maxScore, err := searchChunks(es, questionEmbedding)
     if err != nil {
         return fmt.Errorf("error searching for chunks: %w", err)
     }
+    log.Printf("Retrieved %d document chunks (highest similarity score: %.4f)", len(results), maxScore)
 
-    // Build context
+
     var contextText string
-    for _, result := range results {
+    for i, result := range results {
+        log.Printf("Chunk %d - Heading: %q", i+1, result["heading"])
         contextText += result["content"].(string) + "\n"
     }
 
-    // Generate answer
+    log.Printf("Generating Answer...")
     answer, err := generateAnswer(client, contextText, question)
     if err != nil {
         return fmt.Errorf("error generating answer: %w", err)
@@ -77,10 +90,14 @@ func processQuestion(client *openai.Client, es *elasticsearch.Client, question s
     fmt.Println("\nAnswer:")
     fmt.Println(answer)
     fmt.Println()
+
+
+    elapsed := time.Since(startTime)
+    log.Printf("Total processing time: %v", elapsed)
     return nil
 }
 
-func searchChunks(es *elasticsearch.Client, questionEmbedding []float64) ([]map[string]interface{}, error) {
+func searchChunks(es *elasticsearch.Client, questionEmbedding []float64) ([]map[string]interface{}, float64, error) {
     // Construct the search query
     query := map[string]interface{}{
         "size": 3, // Get top 3 most relevant chunks
@@ -103,7 +120,7 @@ func searchChunks(es *elasticsearch.Client, questionEmbedding []float64) ([]map[
     // Convert query to JSON
     queryJSON, err := json.Marshal(query)
     if err != nil {
-        return nil, fmt.Errorf("error marshalling query: %w", err)
+        return nil, 0, fmt.Errorf("error marshalling query: %w", err)
     }
 
     // Perform the search
@@ -112,46 +129,49 @@ func searchChunks(es *elasticsearch.Client, questionEmbedding []float64) ([]map[
         es.Search.WithBody(strings.NewReader(string(queryJSON))),
     )
     if err != nil {
-        return nil, fmt.Errorf("error performing search: %w", err)
+        return nil, 0, fmt.Errorf("error performing search: %w", err)
     }
     defer res.Body.Close()
 
     if res.IsError() {
-        return nil, fmt.Errorf("search error: %s", res.String())
+        return nil, 0, fmt.Errorf("search error: %s", res.String())
     }
 
     // Parse the response
     var result map[string]interface{}
     if err := json.NewDecoder(res.Body).Decode(&result); err != nil {
-        return nil, fmt.Errorf("error parsing response: %w", err)
+        return nil, 0, fmt.Errorf("error parsing response: %w", err)
     }
 
     // Extract hits
     hits, ok := result["hits"].(map[string]interface{})
     if !ok {
-        return nil, fmt.Errorf("unexpected response format")
+        return nil, 0, fmt.Errorf("unexpected response format")
     }
 
     hitsArray, ok := hits["hits"].([]interface{})
     if !ok {
-        return nil, fmt.Errorf("unexpected hits format")
+        return nil, 0, fmt.Errorf("unexpected hits format")
     }
 
     // Extract source documents
     var chunks []map[string]interface{}
+    var maxScore float64
     for _, hit := range hitsArray {
         hitMap, ok := hit.(map[string]interface{})
         if !ok {
             continue
         }
-        source, ok := hitMap["_source"].(map[string]interface{})
-        if !ok {
-            continue
+        if score, ok := hitMap["_source"].(float64); ok {
+            if score > maxScore {
+                maxScore = score
+            }
         }
+        source, ok := hitMap["_source"].(map[string]interface{})
         chunks = append(chunks, source)
     }
 
-    return chunks, nil
+    return chunks, maxScore -1.0, nil
 }
 
 
